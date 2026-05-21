@@ -1,44 +1,68 @@
 """
-사업보고서 RAG 챗봇
-====================
-PDF 사업보고서를 업로드하면 자연어로 질문할 수 있는 RAG 챗봇.
+================================================================================
+사업보고서 RAG 챗봇 (LlamaIndex + Gemini API + Supabase pgvector)
+================================================================================
+🔄 v2 변경 내역 (한글 PDF 추출 안정화)
+   - PDF 리더를 SimpleDirectoryReader(pypdf 기반) → PyMuPDFReader로 교체
+   - PDF 추출 직후 한글 자모 깨짐 자동 감지 + 경고 표시
+   - requirements.txt에서 pymupdf 버전 고정 (1.24.10)
+   - 회사명·메타데이터 NFC 정규화 추가
 
-기술 스택
----------
-- UI         : Streamlit
-- RAG        : LlamaIndex
-- Vector DB  : Supabase (pgvector)
-- LLM        : Google Gemini 2.5 Flash
-- Embedding  : Google gemini-embedding-001 (768차원)
+📚 이 코드가 하는 일을 한 줄로 요약하면:
+   "PDF 사업보고서를 AI가 읽게 하고, 자연어로 질문하면 출처와 함께 답변하는 챗봇"
+
+🛠 작동 원리 (RAG = Retrieval-Augmented Generation):
+   1) 사업보고서 PDF를 작은 조각(청크)으로 자릅니다.
+   2) 각 청크를 Gemini가 "숫자 벡터"로 변환합니다 (= 임베딩).
+   3) 이 벡터들을 Supabase 벡터 DB에 저장합니다.
+   4) 사용자가 질문하면, 질문도 벡터로 변환해 가장 비슷한 청크를 찾습니다.
+   5) 찾은 청크를 Gemini에게 "참고하라"고 주면서 답변을 생성합니다.
+
+📦 사용 도구:
+   - Streamlit: 웹 챗봇 UI를 만드는 도구
+   - LlamaIndex: RAG 파이프라인을 쉽게 만들어주는 라이브러리
+   - PyMuPDF: PDF에서 텍스트를 추출하는 엔진 (한글에 강건)
+   - Gemini API: LLM(답변 생성) + 임베딩(텍스트→벡터)
+   - Supabase + pgvector: 벡터를 영구 저장하는 클라우드 DB
+================================================================================
 """
 
-from __future__ import annotations
+# --------------------------------------------------------------------------
+# [Section 0] 라이브러리 불러오기 (import)
+# --------------------------------------------------------------------------
+import streamlit as st              # 챗봇 웹페이지를 만드는 도구
+import pandas as pd                  # 표(테이블) 데이터를 다루는 도구
+import tempfile                      # 임시 폴더를 만드는 도구
+import os                            # 파일 경로를 다루는 도구
+import unicodedata                   # 한글 정규화 (NFC/NFD 통일용)
 
-import os
-import re
-import tempfile
-from datetime import datetime
-from typing import Any
+from supabase import create_client, Client  # Supabase(DB) 연결
 
-import streamlit as st
-from supabase import Client, create_client
-
-# LlamaIndex 핵심 모듈 (전역 설정·인덱스·스토리지 컨텍스트)
+# --- LlamaIndex 관련 도구들 (RAG의 핵심) ---
 from llama_index.core import (
-    Settings,
-    StorageContext,
-    VectorStoreIndex,
-    SimpleDirectoryReader,
+    VectorStoreIndex,                # 벡터 인덱스 = "임베딩으로 만든 검색 가능한 데이터 묶음"
+    StorageContext,                  # 어디에 저장할지 알려주는 설정
+    Settings,                        # LlamaIndex의 전역 설정 (LLM, 임베딩 모델 지정)
 )
-from llama_index.llms.gemini import Gemini
-from llama_index.embeddings.gemini import GeminiEmbedding
+
+# 🔄 PDF 리더 교체: SimpleDirectoryReader(pypdf 기반) → PyMuPDFReader
+# PyMuPDF는 MuPDF 엔진을 사용하여 한글 PDF 처리가 훨씬 안정적이에요.
+# pypdf는 마이너 버전마다 한글 처리 로직이 바뀌어 같은 PDF에서도
+# 결과가 달라지는 경우가 있는데, PyMuPDF는 그런 변동이 거의 없습니다.
+from llama_index.readers.file import PyMuPDFReader
+
+# --- Gemini API와 LlamaIndex를 연결하는 어댑터 ---
+from llama_index.llms.google_genai import GoogleGenAI
+from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
+from google.genai.types import EmbedContentConfig
+
+# --- Supabase pgvector와 LlamaIndex를 연결하는 어댑터 ---
 from llama_index.vector_stores.supabase import SupabaseVectorStore
 
 
-# =============================================================================
-# 0. 페이지 기본 설정
-#    - Streamlit 앱이 시작될 때 가장 먼저 1번만 호출되어야 한다.
-# =============================================================================
+# --------------------------------------------------------------------------
+# [Section 1] 페이지 기본 설정
+# --------------------------------------------------------------------------
 st.set_page_config(
     page_title="사업보고서 RAG 챗봇",
     page_icon="📊",
@@ -46,381 +70,377 @@ st.set_page_config(
 )
 
 
-# =============================================================================
-# 1. 시크릿 로드
-#    - .streamlit/secrets.toml 또는 Streamlit Cloud Secrets 패널에서 읽어온다.
-#    - 키가 누락되면 즉시 사용자에게 안내 후 앱을 중단한다 (st.stop).
-# =============================================================================
-def load_secrets() -> dict[str, str]:
-    """필수 시크릿을 한 번에 읽어 검증한다."""
-    required_keys = [
-        "GEMINI_API_KEY",
-        "SUPABASE_URL",
-        "SUPABASE_KEY",
-        "SUPABASE_DB_CONNECTION",
-    ]
-    missing = [k for k in required_keys if k not in st.secrets]
-    if missing:
-        st.error(
-            "❌ 다음 시크릿이 .streamlit/secrets.toml에 없습니다:\n\n"
-            + "\n".join(f"- {k}" for k in missing)
-        )
-        st.stop()
-    return {k: st.secrets[k] for k in required_keys}
+# --------------------------------------------------------------------------
+# [Section 2] 비밀 키(Secrets) 불러오기
+# --------------------------------------------------------------------------
+REQUIRED_KEYS = [
+    "GEMINI_API_KEY",
+    "SUPABASE_URL",
+    "SUPABASE_KEY",
+    "SUPABASE_DB_CONNECTION",
+]
+
+missing_keys = [k for k in REQUIRED_KEYS if k not in st.secrets]
+
+if missing_keys:
+    st.error(
+        f"⚠️ Streamlit Secrets에 다음 키가 등록되지 않았습니다: {', '.join(missing_keys)}\n\n"
+        "📋 등록 방법:\n"
+        "1. Streamlit Cloud → 앱 우측 ⋮ 메뉴 → Settings → Secrets\n"
+        "2. 아래 4개 키를 TOML 형식으로 입력:\n\n"
+        '   GEMINI_API_KEY = "본인의 제미나이 키"\n'
+        '   SUPABASE_URL = "https://xxxxx.supabase.co"\n'
+        '   SUPABASE_KEY = "본인의 수파베이스 키"\n'
+        '   SUPABASE_DB_CONNECTION = "postgresql://postgres.xxx:비밀번호@aws-0-xx.pooler.supabase.com:6543/postgres"\n\n'
+        "3. Save 후 앱 재시작"
+    )
+    st.stop()
+
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+SUPABASE_DB_CONNECTION = st.secrets["SUPABASE_DB_CONNECTION"]
 
 
-SECRETS = load_secrets()
-
-
-# =============================================================================
-# 2. 캐싱된 초기화 함수
-#    - @st.cache_resource: 무거운 자원(클라이언트·모델 등)을 1회만 만들고
-#      이후 모든 사용자 세션이 재활용 → 비용 절약 & 속도 향상
-# =============================================================================
-@st.cache_resource(show_spinner=False)
+# --------------------------------------------------------------------------
+# [Section 3] Supabase 및 LlamaIndex 초기화
+# --------------------------------------------------------------------------
+@st.cache_resource
 def init_supabase() -> Client:
-    """
-    Supabase REST API 클라이언트 초기화.
-
-    chat_history 테이블 CRUD에 사용된다.
-    """
-    return create_client(SECRETS["SUPABASE_URL"], SECRETS["SUPABASE_KEY"])
+    """Supabase API 클라이언트를 만듭니다."""
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-@st.cache_resource(show_spinner=False)
-def init_llama_index() -> bool:
+@st.cache_resource
+def init_llama_index():
     """
-    LlamaIndex의 전역 Settings에 LLM·임베딩·청크 설정을 등록.
+    LlamaIndex가 어떤 LLM과 임베딩 모델을 쓸지 전역 설정합니다.
 
-    Settings는 싱글톤이므로 한 번만 설정하면 이후 모든 인덱스/쿼리에 적용된다.
+    🧠 LLM: Gemini 2.5 Flash (무료 티어, 빠른 답변)
+    🔢 임베딩: gemini-embedding-001 (3072 → 768차원으로 축소)
+    📝 청크: 500자 단위, 50자 겹침
     """
-    # LLM: 답변 생성용 (temperature 낮춰서 일관된 답변)
-    Settings.llm = Gemini(
-        model="models/gemini-2.5-flash",
-        api_key=SECRETS["GEMINI_API_KEY"],
-        temperature=0.1,
+    Settings.llm = GoogleGenAI(
+        model="gemini-2.5-flash",
+        api_key=GEMINI_API_KEY,
+        temperature=0.1,  # 사업보고서는 정확성 우선
     )
-
-    # 임베딩: 문서를 벡터로 변환 (768차원으로 명시 → DB 컬럼과 일치 필요)
-    Settings.embed_model = GeminiEmbedding(
-        model_name="models/gemini-embedding-001",
-        api_key=SECRETS["GEMINI_API_KEY"],
-        output_dimensionality=768,
+    Settings.embed_model = GoogleGenAIEmbedding(
+        model_name="gemini-embedding-001",
+        api_key=GEMINI_API_KEY,
+        embedding_config=EmbedContentConfig(
+            output_dimensionality=768  # Matryoshka로 축소
+        ),
     )
-
-    # 청크: 문서를 잘게 쪼개는 단위. 500자 + 50자 겹침
     Settings.chunk_size = 500
     Settings.chunk_overlap = 50
-    return True
 
 
-def _normalize_collection_name(company_name: str) -> str:
-    """
-    회사명을 Supabase collection_name 규칙에 맞게 정규화.
-
-    - 소문자 변환
-    - 공백·특수문자를 언더스코어(_)로 치환
-    - 영문/숫자/언더스코어만 남김
-    """
-    name = company_name.strip().lower().replace(" ", "_")
-    name = re.sub(r"[^a-z0-9_]+", "_", name)
-    return name.strip("_") or "default"
-
-
-@st.cache_resource(show_spinner=False)
-def get_vector_store(company_name: str) -> SupabaseVectorStore:
-    """
-    회사별 SupabaseVectorStore 인스턴스를 반환.
-
-    Parameters
-    ----------
-    company_name : str
-        회사명. 내부에서 소문자·언더스코어 정규화하여 collection_name으로 사용.
-    """
+@st.cache_resource
+def get_vector_store(company_name: str):
+    """Supabase pgvector에 연결된 LlamaIndex 벡터 스토어를 반환합니다."""
     return SupabaseVectorStore(
-        postgres_connection_string=SECRETS["SUPABASE_DB_CONNECTION"],
-        collection_name=_normalize_collection_name(company_name),
+        postgres_connection_string=SUPABASE_DB_CONNECTION,
+        collection_name=company_name.replace(" ", "_").lower(),
         dimension=768,
     )
 
 
-# 앱 시작 시 LlamaIndex 전역 설정을 미리 적용
+# --------------------------------------------------------------------------
+# 🆕 [Section 3.5] PDF 추출 품질 검사 함수
+# --------------------------------------------------------------------------
+def check_korean_extraction_quality(documents):
+    """
+    PDF에서 추출된 텍스트가 한글 자모로 깨졌는지 페이지별로 검사합니다.
+
+    📍 왜 필요한가?
+       PDF 안의 폰트 매핑(ToUnicode CMap)이 손상돼 있으면,
+       "안녕하세요" 같은 텍스트가 "ㅇㅏㄴㄴㅕㅇㅎㅏㅅㅔㅇㅛ"처럼
+       자모로 분리되어 추출되는 경우가 있어요.
+
+    📍 검사 방법:
+       각 페이지의 텍스트에서:
+       - 완성형 한글(가-힣) 개수
+       - 한글 자모(ㄱ-ㅣ) 개수
+       를 세어, 자모 비율이 비정상적으로 높으면 깨진 페이지로 판단합니다.
+
+    반환값: 깨진 페이지 번호 리스트 (정상이면 빈 리스트)
+    """
+    broken_pages = []
+    for doc in documents:
+        text = doc.text.strip()
+        # 거의 빈 페이지(차트만 있거나 표지 등)는 검사 생략
+        if len(text) < 30:
+            continue
+
+        # 완성형 한글 글자 수 (가-힣)
+        full_korean = sum(1 for c in text if '\uAC00' <= c <= '\uD7A3')
+        # 한글 자모 글자 수 (ㄱ-ㅣ) — 정상 텍스트에는 거의 없어야 정상
+        jamo = sum(1 for c in text if '\u3131' <= c <= '\u318E')
+
+        # 자모가 완성형보다 많거나, 전체 텍스트의 5% 이상이면 깨진 페이지
+        is_broken = (jamo > full_korean) or (jamo / len(text) > 0.05)
+        if is_broken:
+            page_label = doc.metadata.get("page_label", "?")
+            broken_pages.append(page_label)
+
+    return broken_pages
+
+
+# 위의 함수들을 실제로 실행해서 사용 준비
+supabase = init_supabase()
 init_llama_index()
-supabase: Client = init_supabase()
 
 
-# =============================================================================
-# 3. 핵심 도메인 함수
-# =============================================================================
-def build_index_from_pdf(pdf_file, company_name: str) -> int:
-    """
-    업로드된 PDF를 임베딩하여 Supabase pgvector에 저장.
-
-    Returns
-    -------
-    int
-        인덱싱된 청크(노드) 수
-    """
-    # 1) 업로드된 파일을 임시 디렉터리에 저장 (LlamaIndex가 경로 기반으로 읽음)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        pdf_path = os.path.join(tmpdir, pdf_file.name)
-        with open(pdf_path, "wb") as f:
-            f.write(pdf_file.read())
-
-        # 2) PDF 로딩 (페이지별로 Document 객체 생성)
-        documents = SimpleDirectoryReader(input_files=[pdf_path]).load_data()
-
-        # 3) 각 Document에 회사명 메타데이터 추가 (필터링·출처 표시용)
-        for doc in documents:
-            doc.metadata["company_name"] = company_name
-
-        # 4) Supabase Vector Store 준비
-        vector_store = get_vector_store(company_name)
-        storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
-        # 5) 인덱싱 (자동으로 청크 분할 → 임베딩 → DB 저장)
-        index = VectorStoreIndex.from_documents(
-            documents=documents,
-            storage_context=storage_context,
-            show_progress=False,
-        )
-
-        # 인덱싱된 노드(청크) 개수 추정
-        return len(index.docstore.docs)
-
-
-def ask_question(company_name: str, question: str) -> tuple[str, list[dict[str, Any]]]:
-    """
-    질의에 대한 답변과 출처 페이지 정보를 반환.
-
-    Returns
-    -------
-    answer : str
-    sources : list[dict]
-        [{"page": 3, "score": 0.82, "snippet": "..."}, ...]
-    """
-    # 기존에 적재된 Vector Store에서 인덱스 로드
-    vector_store = get_vector_store(company_name)
-    index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
-
-    # similarity_top_k: 유사 청크 몇 개를 LLM에 함께 전달할지
-    query_engine = index.as_query_engine(similarity_top_k=4)
-    response = query_engine.query(question)
-
-    # 출처 추출 (LlamaIndex는 source_nodes에 청크 메타데이터를 담아줌)
-    sources: list[dict[str, Any]] = []
-    for node in response.source_nodes:
-        meta = node.node.metadata or {}
-        # pypdf 기반 리더는 "page_label" 키로 페이지를 제공
-        page = meta.get("page_label") or meta.get("page_number") or "?"
-        sources.append(
-            {
-                "page": str(page),
-                "score": round(float(node.score), 3) if node.score is not None else None,
-                "snippet": node.node.get_content()[:120].replace("\n", " ") + "…",
-            }
-        )
-
-    return str(response), sources
-
-
-def save_chat_history(
-    question: str, answer: str, sources: list[dict[str, Any]], company_name: str
-) -> None:
-    """대화 1건을 chat_history 테이블에 저장."""
-    supabase.table("chat_history").insert(
-        {
-            "question": question,
-            "answer": answer,
-            "sources": sources,
-            "company_name": company_name,
-        }
-    ).execute()
-
-
-def fetch_chat_history(company_name: str | None = None, limit: int = 50) -> list[dict]:
-    """대화 이력을 최신순으로 조회."""
-    query = supabase.table("chat_history").select("*").order("created_at", desc=True).limit(limit)
-    if company_name:
-        query = query.eq("company_name", company_name)
-    return query.execute().data or []
-
-
-def fetch_company_list() -> list[str]:
-    """저장된 회사명 목록을 중복 제거하여 반환."""
-    rows = (
-        supabase.table("chat_history")
-        .select("company_name")
-        .not_.is_("company_name", "null")
-        .execute()
-        .data
-        or []
-    )
-    return sorted({r["company_name"] for r in rows if r.get("company_name")})
-
-
-# =============================================================================
-# 4. 화면 구성
-# =============================================================================
+# --------------------------------------------------------------------------
+# [Section 4] 화면 UI 구성
+# --------------------------------------------------------------------------
 st.title("📊 사업보고서 RAG 챗봇")
-st.caption("PDF 사업보고서를 업로드하고 자연어로 질문하세요. 답변에는 출처 페이지가 함께 표시됩니다.")
+st.info(
+    "💡 안내: PDF 사업보고서를 업로드하면, "
+    "AI가 내용을 학습하고 자연어로 질문에 답해드립니다.\n\n"
+    "📌 권장: 사업보고서 1개만 업로드해서 시작하세요. "
+    "여러 개 올리면 검색 시 결과가 섞일 수 있어요."
+)
 
-# 세션 상태 초기화: 챗봇 탭에서 메시지 기록 유지
+
+# --- 세션 상태 초기화 ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
-
-tab_upload, tab_chat, tab_history = st.tabs(["📤 업로드", "💬 챗봇", "📜 채팅 기록"])
-
-
-# -----------------------------------------------------------------------------
-# Tab 1. 업로드 - PDF 인덱싱
-# -----------------------------------------------------------------------------
-with tab_upload:
-    st.subheader("PDF 사업보고서 업로드")
-
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        pdf_file = st.file_uploader("사업보고서 PDF 선택", type=["pdf"])
-    with col2:
-        company_name_input = st.text_input(
-            "회사명",
-            placeholder="예: 삼성전자",
-            help="이 회사명으로 벡터 컬렉션이 생성/구분됩니다.",
-        )
-
-    if st.button("🚀 인덱싱 실행", type="primary", disabled=not (pdf_file and company_name_input)):
-        try:
-            with st.spinner("PDF를 분석하고 벡터 DB에 저장하는 중입니다... (수십 초~수 분 소요)"):
-                node_count = build_index_from_pdf(pdf_file, company_name_input.strip())
-            st.success(
-                f"✅ **{company_name_input}** 인덱싱 완료! "
-                f"총 **{node_count}개**의 청크가 저장되었습니다."
-            )
-            st.balloons()
-        except Exception as e:  # noqa: BLE001
-            st.error(f"❌ PDF 처리 중 오류가 발생했습니다: {e}")
+if "current_company" not in st.session_state:
+    st.session_state.current_company = None
+if "index" not in st.session_state:
+    st.session_state.index = None
 
 
-# -----------------------------------------------------------------------------
-# Tab 2. 챗봇 - 질의응답
-# -----------------------------------------------------------------------------
-with tab_chat:
-    st.subheader("질의응답")
+# --- 화면을 3개의 탭으로 나누기 ---
+tab1, tab2, tab3 = st.tabs(["📤 업로드", "💬 챗봇", "📜 채팅 기록"])
 
-    try:
-        companies = fetch_company_list()
-    except Exception as e:  # noqa: BLE001
-        st.error(f"❌ DB 연결 오류: {e}")
-        companies = []
 
-    # 업로드는 했지만 아직 대화 기록이 없는 회사도 고를 수 있도록 직접 입력 옵션 제공
-    target_company = st.selectbox(
-        "분석 대상 회사 선택",
-        options=["(직접 입력)"] + companies,
-        index=0,
+# ==========================================================================
+# [탭 1] 사업보고서 업로드 (PDF 인덱싱)
+# ==========================================================================
+with tab1:
+    st.subheader("사업보고서 인덱싱")
+
+    company_name = st.text_input(
+        "🏢 회사명 입력",
+        placeholder="예: 삼성전자, 카카오, 네이버",
+        help="이 보고서가 어느 회사의 것인지 표시하기 위한 라벨입니다.",
     )
-    if target_company == "(직접 입력)":
-        target_company = st.text_input("회사명 입력", value="", placeholder="업로드 탭에서 사용한 회사명")
 
-    # 기존 메시지 출력
+    uploaded_file = st.file_uploader(
+        "📄 PDF 파일 선택",
+        type=["pdf"],
+        help="DART(전자공시시스템)에서 다운로드한 사업보고서 PDF를 업로드하세요.",
+    )
+
+    if uploaded_file is not None and company_name:
+        if st.button("🚀 PDF 인덱싱 시작", type="primary"):
+            with st.spinner("PDF 읽고 임베딩하는 중... (약 1-3분 소요)"):
+                try:
+                    # -----------------------------------------------------
+                    # 단계 1: PDF를 임시 폴더에 저장
+                    # -----------------------------------------------------
+                    # 🔄 변경: 파일명을 영문 고정으로 — OS별 한글 파일명 인코딩 차이 회피
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        file_path = os.path.join(temp_dir, "document.pdf")
+                        with open(file_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+
+                        # -----------------------------------------------------
+                        # 단계 2: 🔄 PDF 읽기 (PyMuPDFReader 사용)
+                        # -----------------------------------------------------
+                        # PyMuPDFReader는 pypdf보다 한글 PDF 처리가 안정적입니다.
+                        # 페이지 단위로 Document 객체 리스트를 반환해요.
+                        reader = PyMuPDFReader()
+                        documents = reader.load(file_path=file_path)
+
+                        # PyMuPDFReader가 자동 설정하지 않는 메타데이터 보정
+                        # (LlamaIndex의 다른 부분에서 page_label, file_name을 기대하므로)
+                        original_filename = unicodedata.normalize(
+                            "NFC", uploaded_file.name
+                        )
+                        for i, doc in enumerate(documents):
+                            if "page_label" not in doc.metadata:
+                                doc.metadata["page_label"] = str(i + 1)
+                            doc.metadata["file_name"] = original_filename
+
+                        # -----------------------------------------------------
+                        # 🆕 단계 2.5: 한글 추출 품질 검사
+                        # -----------------------------------------------------
+                        # PyMuPDF가 처리하지 못한 페이지가 있는지 사전에 확인합니다.
+                        # 자모로 깨진 텍스트가 그대로 임베딩되면 검색 품질이 크게 떨어져요.
+                        broken_pages = check_korean_extraction_quality(documents)
+
+                        if broken_pages:
+                            pages_preview = ", ".join(broken_pages[:10])
+                            if len(broken_pages) > 10:
+                                pages_preview += f" ... (총 {len(broken_pages)}페이지)"
+                            st.error(
+                                f"⚠️ 다음 페이지에서 한글이 자모로 깨져 추출되었습니다:\n\n"
+                                f"**페이지 {pages_preview}**\n\n"
+                                "이 PDF는 폰트 매핑 정보가 손상된 페이지를 포함합니다. "
+                                "다음을 시도해 보세요:\n"
+                                "1. PDF를 다른 출처에서 다시 다운로드 (DART에서 Ctrl+P → PDF로 저장 권장)\n"
+                                "2. 또는 OCR 처리된 PDF로 변환 후 재시도\n\n"
+                                "인덱싱을 중단합니다. (깨진 데이터로 검색하면 정확하지 않은 답변이 생성됩니다)"
+                            )
+                            st.stop()
+
+                        # -----------------------------------------------------
+                        # 단계 3: 각 문서에 메타데이터(회사명) 추가
+                        # -----------------------------------------------------
+                        # 🔄 변경: 회사명을 NFC로 정규화 (Mac NFD 입력도 통일)
+                        safe_company = unicodedata.normalize(
+                            "NFC", company_name
+                        ).strip()
+                        for doc in documents:
+                            doc.metadata["company"] = safe_company
+                            # 모든 문자열 메타데이터도 NFC로 통일
+                            for key, value in list(doc.metadata.items()):
+                                if isinstance(value, str):
+                                    doc.metadata[key] = unicodedata.normalize(
+                                        "NFC", value
+                                    )
+
+                        # -----------------------------------------------------
+                        # 단계 4: 벡터 스토어 + 인덱스 생성 (핵심!)
+                        # -----------------------------------------------------
+                        # 한 줄에서 자동으로 일어나는 일:
+                        # 1) documents를 500자 청크로 자르기
+                        # 2) 각 청크를 Gemini로 768차원 벡터로 임베딩
+                        # 3) Supabase pgvector에 저장
+                        vector_store = get_vector_store(safe_company)
+                        storage_context = StorageContext.from_defaults(
+                            vector_store=vector_store
+                        )
+                        index = VectorStoreIndex.from_documents(
+                            documents,
+                            storage_context=storage_context,
+                            show_progress=True,
+                        )
+
+                        st.session_state.index = index
+                        st.session_state.current_company = safe_company
+
+                    # 성공 메시지
+                    st.success(
+                        f"✅ '{safe_company}' PDF 인덱싱 완료! "
+                        f"({len(documents)} 페이지 처리)"
+                    )
+                    st.info("💬 챗봇 탭으로 이동해서 질문해보세요.")
+
+                except Exception as e:
+                    st.error(f"오류 발생: {e}")
+
+
+# ==========================================================================
+# [탭 2] 챗봇 (RAG로 질문 답변)
+# ==========================================================================
+with tab2:
+    st.subheader("💬 사업보고서에 질문하기")
+
+    if st.session_state.current_company:
+        st.caption(f"📁 분석 대상: **{st.session_state.current_company}**")
+    else:
+        st.warning("⚠ 먼저 '업로드' 탭에서 사업보고서를 인덱싱해주세요.")
+
+    # 이전 대화 화면에 표시
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg.get("sources"):
-                with st.expander("📎 출처 보기"):
-                    for s in msg["sources"]:
-                        st.markdown(
-                            f"- **p.{s['page']}** "
-                            f"(유사도 {s['score']}) — {s['snippet']}"
-                        )
+                with st.expander("📄 참고 출처"):
+                    for src in msg["sources"]:
+                        st.caption(src)
 
-    user_q = st.chat_input("사업보고서에 대해 궁금한 점을 입력하세요")
-    if user_q:
-        if not target_company:
-            st.warning("⚠️ 먼저 회사명을 선택하거나 입력해 주세요.")
+    # 사용자 새 질문 입력
+    if prompt := st.chat_input("질문을 입력하세요 (예: 작년 매출은?)"):
+        if not st.session_state.index:
+            st.error("먼저 사업보고서를 업로드해주세요.")
         else:
-            # 사용자 메시지 표시
-            st.session_state.messages.append({"role": "user", "content": user_q})
+            st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
-                st.markdown(user_q)
+                st.markdown(prompt)
 
-            # 답변 생성
             with st.chat_message("assistant"):
-                with st.spinner("답변을 생성하는 중..."):
+                with st.spinner("답변 생성 중..."):
                     try:
-                        answer, sources = ask_question(target_company, user_q)
-                    except Exception as e:  # noqa: BLE001
-                        answer, sources = f"❌ 답변 생성 중 오류: {e}", []
+                        # RAG 쿼리 실행 (검색 + 답변 생성)
+                        query_engine = st.session_state.index.as_query_engine(
+                            similarity_top_k=5,
+                        )
+                        response = query_engine.query(prompt)
 
-                st.markdown(answer)
-                if sources:
-                    with st.expander("📎 출처 보기"):
-                        for s in sources:
-                            st.markdown(
-                                f"- **p.{s['page']}** "
-                                f"(유사도 {s['score']}) — {s['snippet']}"
+                        answer = str(response)
+                        st.markdown(answer)
+
+                        # 출처 추출
+                        sources = []
+                        for node in response.source_nodes:
+                            page = node.metadata.get("page_label", "?")
+                            sources.append(
+                                f"페이지 {page}: {node.text[:100]}..."
                             )
 
-            # 세션 상태 + DB 저장
-            st.session_state.messages.append(
-                {"role": "assistant", "content": answer, "sources": sources}
-            )
-            try:
-                save_chat_history(user_q, answer, sources, target_company)
-            except Exception as e:  # noqa: BLE001
-                st.warning(f"⚠️ 대화 이력 저장 실패: {e}")
+                        if sources:
+                            with st.expander("📄 참고 출처"):
+                                for src in sources:
+                                    st.caption(src)
 
-
-# -----------------------------------------------------------------------------
-# Tab 3. 채팅 기록 - chat_history 조회
-# -----------------------------------------------------------------------------
-with tab_history:
-    st.subheader("저장된 대화 이력")
-
-    try:
-        companies = fetch_company_list()
-    except Exception as e:  # noqa: BLE001
-        st.error(f"❌ DB 연결 오류: {e}")
-        companies = []
-
-    filter_company = st.selectbox(
-        "회사 필터",
-        options=["(전체)"] + companies,
-        index=0,
-    )
-
-    try:
-        rows = fetch_chat_history(
-            company_name=None if filter_company == "(전체)" else filter_company,
-            limit=100,
-        )
-    except Exception as e:  # noqa: BLE001
-        st.error(f"❌ DB 조회 오류: {e}")
-        rows = []
-
-    if not rows:
-        st.info("아직 저장된 대화가 없습니다.")
-    else:
-        st.caption(f"총 **{len(rows)}**건 (최신순)")
-        for row in rows:
-            created = row.get("created_at", "")
-            try:
-                # ISO 문자열을 보기 좋게 포맷
-                created = datetime.fromisoformat(created.replace("Z", "+00:00")).strftime(
-                    "%Y-%m-%d %H:%M"
-                )
-            except Exception:  # noqa: BLE001
-                pass
-
-            title = f"🕒 {created} · 🏢 {row.get('company_name', '-')} · ❓ {row['question'][:40]}…"
-            with st.expander(title):
-                st.markdown(f"**Q.** {row['question']}")
-                st.markdown(f"**A.** {row['answer']}")
-                src = row.get("sources") or []
-                if src:
-                    st.markdown("**📎 출처**")
-                    for s in src:
-                        st.markdown(
-                            f"- p.{s.get('page', '?')} "
-                            f"(유사도 {s.get('score', '-')}) — {s.get('snippet', '')}"
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": answer, "sources": sources}
                         )
+
+                        # Supabase chat_history 테이블에 대화 저장
+                        try:
+                            supabase.table("chat_history").insert(
+                                {
+                                    "question": prompt,
+                                    "answer": answer,
+                                    "sources": sources,
+                                    "company_name": st.session_state.current_company,
+                                }
+                            ).execute()
+                        except Exception as db_e:
+                            st.toast(f"DB 저장 실패: {db_e}")
+
+                    except Exception as e:
+                        st.error(f"답변 생성 오류: {e}")
+
+
+# ==========================================================================
+# [탭 3] 채팅 기록 (Supabase에 저장된 과거 대화 보기)
+# ==========================================================================
+with tab3:
+    st.subheader("📜 채팅 기록")
+
+    try:
+        response = (
+            supabase.table("chat_history")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute()
+        )
+
+        if response.data:
+            df = pd.DataFrame(response.data)
+            df = df[["created_at", "company_name", "question", "answer"]]
+            df.columns = ["시간", "회사", "질문", "답변"]
+
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            csv = df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 CSV로 다운로드",
+                csv,
+                "chat_history.csv",
+                "text/csv",
+            )
+        else:
+            st.info("아직 저장된 대화가 없습니다. 챗봇 탭에서 질문해보세요!")
+
+    except Exception as e:
+        st.error(f"채팅 기록 불러오기 실패: {e}")
