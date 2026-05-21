@@ -1,10 +1,16 @@
-streamlit
-supabase
-llama-index
-llama-index-llms-google-genai
-llama-index-embeddings-google-genai
-llama-index-vector-stores-supabase
-llama-index-readers-web
-vecs
-pypdf
-pandas
+# --- UI ---
+streamlit>=1.36.0
+
+# --- RAG 프레임워크 (LlamaIndex) ---
+llama-index-core>=0.11.0
+llama-index-llms-gemini>=0.4.0
+llama-index-embeddings-gemini>=0.2.0
+llama-index-vector-stores-supabase>=0.3.0
+llama-index-readers-file>=0.2.0
+
+# --- Supabase (REST API용) ---
+supabase>=2.7.0
+
+# --- 보조 도구 ---
+python-dotenv>=1.0.1
+pypdf>=4.3.0
