@@ -2,11 +2,13 @@
 ================================================================================
 사업보고서 RAG 챗봇 (LlamaIndex + Gemini API + Supabase pgvector)
 ================================================================================
-🔄 v2 변경 내역 (한글 PDF 추출 안정화)
-   - PDF 리더를 SimpleDirectoryReader(pypdf 기반) → PyMuPDFReader로 교체
-   - PDF 추출 직후 한글 자모 깨짐 자동 감지 + 경고 표시
-   - requirements.txt에서 pymupdf 버전 고정 (1.24.10)
-   - 회사명·메타데이터 NFC 정규화 추가
+🔄 v3 변경 내역 (Python 3.14 호환성 개선)
+   - PDF 리더를 PyMuPDFReader → PDFReader(pypdf 기반)로 폴백
+     · 이유: Python 3.14에서는 PyMuPDF(C 확장) 휠이 PyPI에 없어 설치 실패
+     · 한글 추출 안정성은 check_korean_extraction_quality()로 보완
+   - requirements.txt에서 pymupdf 제거, pypdf 명시 추가
+   - PDF 추출 직후 한글 자모 깨짐 자동 감지 + 경고 표시 (v2 유지)
+   - 회사명·메타데이터 NFC 정규화 (v2 유지)
 
 📚 이 코드가 하는 일을 한 줄로 요약하면:
    "PDF 사업보고서를 AI가 읽게 하고, 자연어로 질문하면 출처와 함께 답변하는 챗봇"
@@ -21,7 +23,7 @@
 📦 사용 도구:
    - Streamlit: 웹 챗봇 UI를 만드는 도구
    - LlamaIndex: RAG 파이프라인을 쉽게 만들어주는 라이브러리
-   - PyMuPDF: PDF에서 텍스트를 추출하는 엔진 (한글에 강건)
+   - pypdf: PDF에서 텍스트를 추출하는 순수 Python 엔진
    - Gemini API: LLM(답변 생성) + 임베딩(텍스트→벡터)
    - Supabase + pgvector: 벡터를 영구 저장하는 클라우드 DB
 ================================================================================
@@ -45,11 +47,10 @@ from llama_index.core import (
     Settings,                        # LlamaIndex의 전역 설정 (LLM, 임베딩 모델 지정)
 )
 
-# 🔄 PDF 리더 교체: SimpleDirectoryReader(pypdf 기반) → PyMuPDFReader
-# PyMuPDF는 MuPDF 엔진을 사용하여 한글 PDF 처리가 훨씬 안정적이에요.
-# pypdf는 마이너 버전마다 한글 처리 로직이 바뀌어 같은 PDF에서도
-# 결과가 달라지는 경우가 있는데, PyMuPDF는 그런 변동이 거의 없습니다.
-from llama_index.readers.file import PyMuPDFReader
+# 🔄 PDF 리더: PyMuPDFReader는 Python 3.14에서 휠이 제공되지 않아 설치 실패가 잦습니다.
+# 따라서 순수 Python으로 동작하는 PDFReader(pypdf 기반)로 폴백합니다.
+# 한글 자모 깨짐은 아래 check_korean_extraction_quality()에서 사전 감지합니다.
+from llama_index.readers.file import PDFReader
 
 # --- Gemini API와 LlamaIndex를 연결하는 어댑터 ---
 from llama_index.llms.google_genai import GoogleGenAI
@@ -249,14 +250,14 @@ with tab1:
                             f.write(uploaded_file.getbuffer())
 
                         # -----------------------------------------------------
-                        # 단계 2: 🔄 PDF 읽기 (PyMuPDFReader 사용)
+                        # 단계 2: 🔄 PDF 읽기 (PDFReader = pypdf 기반)
                         # -----------------------------------------------------
-                        # PyMuPDFReader는 pypdf보다 한글 PDF 처리가 안정적입니다.
-                        # 페이지 단위로 Document 객체 리스트를 반환해요.
-                        reader = PyMuPDFReader()
-                        documents = reader.load(file_path=file_path)
+                        # Python 3.14 호환을 위해 PyMuPDFReader → PDFReader로 폴백.
+                        # 페이지 단위로 Document 객체 리스트를 반환합니다.
+                        reader = PDFReader(return_full_document=False)
+                        documents = reader.load_data(file=file_path)
 
-                        # PyMuPDFReader가 자동 설정하지 않는 메타데이터 보정
+                        # PDFReader가 자동 설정하지 않는 메타데이터 보정
                         # (LlamaIndex의 다른 부분에서 page_label, file_name을 기대하므로)
                         original_filename = unicodedata.normalize(
                             "NFC", uploaded_file.name
@@ -269,7 +270,7 @@ with tab1:
                         # -----------------------------------------------------
                         # 🆕 단계 2.5: 한글 추출 품질 검사
                         # -----------------------------------------------------
-                        # PyMuPDF가 처리하지 못한 페이지가 있는지 사전에 확인합니다.
+                        # pypdf가 처리하지 못한 페이지가 있는지 사전에 확인합니다.
                         # 자모로 깨진 텍스트가 그대로 임베딩되면 검색 품질이 크게 떨어져요.
                         broken_pages = check_korean_extraction_quality(documents)
 
