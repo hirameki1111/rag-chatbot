@@ -1,0 +1,10 @@
+streamlit
+supabase
+llama-index
+llama-index-llms-google-genai
+llama-index-embeddings-google-genai
+llama-index-vector-stores-supabase
+llama-index-readers-web
+vecs
+pypdf
+pandas
